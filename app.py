@@ -15,7 +15,7 @@ from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
-from pydantic import condecimal
+
 
 # ==== módulos locales (debes tener estos archivos) ====
 # validator.py: def validate_inputs(dict)->dict ; class ValidationError(Exception)
