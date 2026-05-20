@@ -9,7 +9,7 @@ env_content = """# =============================================================
 SMTP_HOST=smtp.gmail.com
 SMTP_PORT=465
 SMTP_USER=sebaxto@gmail.com
-SMTP_PASS=vsyt ovtq rbjn vuvi
+SMTP_PASS=vsytovtqrbjnvuvi
 SMTP_FROM=sebaxto@gmail.com
 
 # ==============================================================================
