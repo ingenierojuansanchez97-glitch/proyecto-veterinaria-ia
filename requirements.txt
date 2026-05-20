@@ -10,7 +10,7 @@ joblib
 scikit-learn
 reportlab
 email-validator
-openai
+google-genai
 fpdf2
 matplotlib
 python-multipart
