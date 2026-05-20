@@ -1,10 +1,9 @@
 # app.py — Web app completa con auth, dashboard, predicción, PDF e IA
-
 import os
 import sqlite3
 import hashlib
 import secrets
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional, Dict, Any, Tuple
 
 import numpy as np
@@ -16,8 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 
-
-# ==== módulos locales (debes tener estos archivos) ====
+# ==== módulos locales ====
 from validator import validate_inputs, ValidationError
 from mailer import send_email
 from ai_consult import consult_ai
@@ -32,20 +30,24 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.getenv("KIDNEY_APP_DB", os.path.join(BASE_DIR, "veterinaria.db"))
 MODEL_PATH = os.getenv("KIDNEY_MODEL", os.path.join(BASE_DIR, "model_kidney.pkl"))
 
-SECRET_KEY = os.getenv("APP_SECRET_KEY", "change-this-in-render")
+SECRET_KEY = os.getenv("APP_SECRET_KEY", "supersecreto123")
 
-FEATURES = ["Edad", "Peso", "Creatinina", "Urea", "BUN", "SDMA"]
+# Orden exacto con el que el nuevo modelo fue entrenado
+FEATURES = ["Es_Felino", "Edad", "Peso", "Creatinina", "Urea", "BUN", "SDMA"]
 SPECIES_OPTIONS = ["Canino", "Felino", "Ave", "Pez", "Reptil", "Caballo", "Cerdo", "Vaca", "Otro"]
+
 RISK_LABELS: Dict[int, Tuple[str, str]] = {
     0: ("Bajo", "#43A047"),
     1: ("Medio", "#FB8C00"),
     2: ("Alto", "#E53935"),
 }
 
+# Límites diagnósticos específicos por especie según guías internacionales IRIS
 REF_RANGES = {
-    "Canino": {"Creatinina": 1.4, "Urea": 50, "BUN": 25, "SDMA": 14},
-    "Felino": {"Creatinina": 1.6, "Urea": 60, "BUN": 28, "SDMA": 14},
+    "Canino": {"Creatinina": 1.4, "Urea": 50.0, "BUN": 27.0, "SDMA": 14.0},
+    "Felino": {"Creatinina": 1.6, "Urea": 60.0, "BUN": 30.0, "SDMA": 15.0},
 }
+
 
 # ==================== App & assets ====================
 app = FastAPI(title=APP_TITLE)
@@ -132,6 +134,7 @@ def init_db():
 
 init_db()
 
+
 # ============= Seguridad (hash de password) ============
 def hash_password(pw: str, salt: Optional[str] = None) -> str:
     if not salt:
@@ -150,79 +153,77 @@ def verify_password(pw: str, stored: str) -> bool:
 
 # ======== Reglas clínicas + predicción combinada ========
 def classify_band(vals: dict, especie: str = "Canino"):
-    refs = REF_RANGES.get(especie, REF_RANGES["Canino"])
-    markers = ["Creatinina", "Urea", "BUN", "SDMA"]
+    # Si la especie no está en el mapa, por defecto usamos los límites caninos
+    esp_key = "Felino" if especie.lower() == "felino" else "Canino"
+    refs = REF_RANGES[esp_key]
+    
+    crea = float(vals.get("Creatinina", 0.0))
+    sdma = float(vals.get("SDMA", 0.0))
+    bun = float(vals.get("BUN", 0.0))
+    urea = float(vals.get("Urea", 0.0))
 
-    mild_count = 0
-    severe_count = 0
+    # Evaluación y asignación probabilística adaptada a guías reales IRIS
+    if esp_key == "Felino":
+        if crea >= 2.9 or sdma >= 26.0 or urea > 100.0:
+            band_idx = 2  # Alto
+            p_dist = [0.00, 0.05, 0.95]
+        elif 1.6 <= crea < 2.9 or 15.0 <= sdma < 26.0:
+            band_idx = 1  # Medio (Estadio IRIS 2 temprano/moderado)
+            p_dist = [0.15, 0.70, 0.15]
+        else:
+            band_idx = 0  # Bajo
+            p_dist = [0.85, 0.10, 0.05]
+    else:  # Caninos
+        if crea >= 3.5 or sdma >= 35.0 or urea > 120.0:
+            band_idx = 2  # Alto
+            p_dist = [0.00, 0.05, 0.95]
+        elif 1.4 <= crea < 3.5 or 15.0 <= sdma < 35.0:
+            band_idx = 1  # Medio
+            p_dist = [0.15, 0.70, 0.15]
+        else:
+            band_idx = 0  # Bajo
+            p_dist = [0.85, 0.10, 0.05]
 
-    for m in markers:
-        v = float(vals[m])
-        r = v / float(refs[m])
-        if r > 1.3:
-            severe_count += 1
-        elif r > 1.0:
-            mild_count += 1
-
-    if severe_count >= 1 or (mild_count + severe_count) >= 2:
-        band_idx = 2  # Alto
-    elif mild_count == 1 and severe_count == 0:
-        band_idx = 1  # Medio
-    else:
-        band_idx = 0  # Bajo
-
-    probs = np.zeros(3, dtype=float)
-    probs[band_idx] = 0.80  # regla dominante para arrancar
-    return band_idx, probs
-
-
-def _pad3(arr):
-    arr = np.array(arr, dtype=float).flatten()
-    if arr.shape[0] == 3:
-        s = arr.sum()
-        return arr / s if s > 0 else np.array([1 / 3, 1 / 3, 1 / 3])
-    if arr.shape[0] == 2:
-        arr = np.array([arr[0], 0.0, arr[1]])
-        s = arr.sum()
-        return arr / s if s > 0 else np.array([1 / 3, 1 / 3, 1 / 3])
-    arr = arr[:3] if arr.size >= 3 else np.pad(arr, (0, 3 - arr.size))
-    s = arr.sum()
-    return arr / s if s > 0 else np.array([1 / 3, 1 / 3, 1 / 3])
+    return band_idx, np.array(p_dist, dtype=float)
 
 
-# Cargar modelo de forma segura
+# Cargar modelo de forma segura de predict_kidney_model
 MODEL_BUNDLE = safe_load_model(MODEL_PATH)
 
 
-def predict_blended(vals: dict, especie: str, model_bundle):
-    # 1) Reglas clínicas
+def predict_blended(vals: dict, especie: str, model_bundle: tuple) -> Tuple[int, np.ndarray]:
+    # 1) Reglas clínicas balanceadas
     _, probs_rules = classify_band(vals, especie)
 
-    # 2) Modelo ML
+    # 2) Procesamiento con el Modelo ML
     model, feat_order = model_bundle
-    X = pd.DataFrame([vals])[feat_order]
+    
+    # Preparar el vector inyectando el valor binario de la especie para el clasificador
+    input_data = vals.copy()
+    input_data["Es_Felino"] = 1.0 if especie.lower() == "felino" else 0.0
+    
+    # Asegurar el DataFrame con las 7 columnas exactas requeridas
+    X = pd.DataFrame([input_data])[feat_order]
+    
     probs_ml = safe_predict_proba(model, X)[0]
     probs_ml = np.array(probs_ml, dtype=float)
+    
     s = probs_ml.sum()
     if s <= 0:
         probs_ml = np.array([1/3, 1/3, 1/3])
     else:
         probs_ml = probs_ml / s
 
-    # 3) Mezcla reglas + modelo
+    # 3) Mezcla calibrada (Blending): 40% Reglas Expertas, 60% Aprendizaje Automático
     w_rules = 0.40
     w_ml = 0.60
-    final_probs = w_rules * np.array(probs_rules) + w_ml * probs_ml
-
+    final_probs = w_rules * probs_rules + w_ml * probs_ml
     final_probs = final_probs / final_probs.sum()
+    
     pred_idx = int(np.argmax(final_probs))
 
     try:
-        print(
-            "[DEBUG] rules:", probs_rules,
-            "ml:", probs_ml.tolist(),
-            "final:", final_probs.tolist()
-        )
+        print(f"[DEBUG CLÍNICO] Especie: {especie} -> Rules: {probs_rules.tolist()} | ML: {probs_ml.tolist()} | Blended: {final_probs.tolist()}")
     except Exception:
         pass
 
@@ -304,7 +305,7 @@ def auth_register(
 
     pw_hash = hash_password(password)
     code = secrets.token_hex(3).upper()
-    expires = (datetime.utcnow() + timedelta(hours=1)).isoformat()
+    expires = (datetime.utcnow() + datetime.timedelta(hours=1)).isoformat()
 
     cur.execute(
         "INSERT INTO users (name,email,password_hash,clinic,verification_code,verification_expires) VALUES (?,?,?,?,?,?)",
@@ -323,7 +324,7 @@ def auth_register(
         name="auth.html",
         context={
             "title": APP_TITLE,
-            "success": "Cuenta creada. Revisa tu correo para el código de verificación.",
+            "success": "Cuenta creada con éxito. Ingresa el código enviado a tu correo corporativo.",
         }
     )
 
@@ -406,7 +407,7 @@ def auth_login(request: Request, email: str = Form(...), password: str = Form(..
         return templates.TemplateResponse(
             request=request,
             name="auth.html",
-            context={"title": APP_TITLE, "error": "Cuenta no verificada."}
+            context={"title": APP_TITLE, "error": "Cuenta pendiente por verificación por correo."}
         )
 
     request.session["user"] = {"id": uid, "name": name, "email": email, "clinic": clinic, "role": role}
@@ -428,8 +429,8 @@ def dashboard(request: Request):
     user = current_user(request)
     vals = {}
     result = None
-
     case_id = None
+    
     try:
         q = dict(request.query_params)
         if "case_id" in q and q["case_id"]:
@@ -497,7 +498,6 @@ def predict_form(
         return redirect
 
     user = current_user(request)
-
     raw_vals = {
         "Edad": Edad,
         "Peso": Peso,
@@ -565,7 +565,7 @@ def predict_form(
                 "title": APP_TITLE,
                 "user": user,
                 "species": SPECIES_OPTIONS,
-                "error": f"DB error: {e}",
+                "error": f"Error de Base de Datos: {e}",
                 "vals": {},
                 "history": _history_for(user["id"]),
             }
@@ -578,7 +578,7 @@ def predict_form(
             "title": APP_TITLE,
             "user": user,
             "species": SPECIES_OPTIONS,
-            "success": f"Riesgo {pred_label}",
+            "success": f"Análisis completado: Riesgo {pred_label}",
             "vals": vals,
             "result": {
                 "nombre": nombre,
@@ -611,7 +611,6 @@ def predict_and_pdf(
         return redirect
 
     user = current_user(request)
-
     raw_vals = {
         "Edad": Edad,
         "Peso": Peso,
@@ -640,11 +639,17 @@ def predict_and_pdf(
     pred_idx, probs = predict_blended(vals, especie, MODEL_BUNDLE)
     pred_label, _ = RISK_LABELS[pred_idx]
 
+    # Atributos limpios para renderizado del PDF corporativo
     patient_data = {
         "Nombre": nombre,
         "Especie": especie,
         "Raza": raza,
-        **{k: vals[k] for k in FEATURES},
+        "Edad": vals["Edad"],
+        "Peso": vals["Peso"],
+        "Creatinina": vals["Creatinina"],
+        "Urea": vals["Urea"],
+        "BUN": vals["BUN"],
+        "SDMA": vals["SDMA"]
     }
     prob_dict = {
         "Bajo": float(probs[0]),
@@ -652,9 +657,7 @@ def predict_and_pdf(
         "Alto": float(probs[2]),
     }
 
-    safe_name = "".join(
-        [c for c in nombre if c.isalnum() or c in (" ", "_", "-")]
-    ).strip() or "paciente"
+    safe_name = "".join([c for c in nombre if c.isalnum() or c in (" ", "_", "-")]).strip() or "paciente"
     pdf_path = os.path.join(BASE_DIR, f"reporte_{safe_name}.pdf")
 
     try:
@@ -674,15 +677,14 @@ def predict_and_pdf(
         pdf_url = f"/static/{os.path.basename(pdf_path)}"
 
         try:
-            # Corregido: usando el parámetro 'attachment_path' declarado arriba en tus comentarios estructurales
             send_email(
                 to=user.get("email"),
-                subject="Reporte Predicción Renal",
-                body="Adjunto encontrarás el reporte PDF de tu paciente.",
+                subject=f"Reporte Digital de Diagnóstico Renal - {nombre}",
+                body=f"Estimado Dr. {user.get('name')},\n\nAdjunto encontrará el informe clínico automatizado en formato PDF correspondiente al paciente '{nombre}'.",
                 attachment_path=pdf_path,
             )
         except Exception as e:
-            print("⚠️ Error al enviar correo:", e)
+            print("⚠️ Error al despachar correo electrónico:", e)
 
     except Exception as e:
         return templates.TemplateResponse(
@@ -692,7 +694,7 @@ def predict_and_pdf(
                 "title": APP_TITLE,
                 "user": user,
                 "species": SPECIES_OPTIONS,
-                "error": f"No se pudo generar el PDF: {e}",
+                "error": f"No se pudo estructurar el reporte PDF: {e}",
                 "vals": {},
                 "history": _history_for(user["id"]),
             }
@@ -705,7 +707,7 @@ def predict_and_pdf(
             "title": APP_TITLE,
             "user": user,
             "species": SPECIES_OPTIONS,
-            "success": "✅ PDF generado y enviado al correo.",
+            "success": "✅ PDF generado y enviado con éxito al correo del remitente.",
             "vals": {
                 "Nombre": nombre,
                 "Especie": especie,
@@ -744,7 +746,6 @@ def ai_consult_route(
         return redirect
 
     user = current_user(request)
-
     raw_vals = {
         "Edad": Edad or 0.0,
         "Peso": Peso or 0.0,
@@ -778,6 +779,22 @@ def ai_consult_route(
 
     try:
         ai_text = consult_ai(patient_data, pred_label, prob_dict)
+        
+        # Persistencia del reporte clínico generado por IA en la base de datos local
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE casos_renales 
+            SET ai_text = ? 
+            WHERE user_id = ? AND nombre = ? 
+            ORDER BY id DESC LIMIT 1
+            """,
+            (ai_text, user["id"], nombre.strip())
+        )
+        conn.commit()
+        conn.close()
+        
     except Exception as e:
         ai_text = f"No se pudo consultar a la IA: {e}"
 
@@ -788,7 +805,7 @@ def ai_consult_route(
             "title": APP_TITLE,
             "user": user,
             "species": SPECIES_OPTIONS,
-            "success": "Análisis de IA generado.",
+            "success": "Análisis avanzado de soporte de IA completado.",
             "vals": {
                 "Nombre": nombre,
                 "Especie": especie,
