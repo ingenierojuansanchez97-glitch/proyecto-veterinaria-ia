@@ -7,7 +7,7 @@ env_content = """# =============================================================
 # Configuración SMTP para Gmail
 # ==============================================================================
 SMTP_HOST=smtp.gmail.com
-SMTP_PORT=465
+SMTP_PORT=587
 SMTP_USER=sebaxto@gmail.com
 SMTP_PASS=vsytovtqrbjnvuvi
 SMTP_FROM=sebaxto@gmail.com
