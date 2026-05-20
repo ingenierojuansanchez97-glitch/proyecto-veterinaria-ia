@@ -5,9 +5,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-api_key = os.getenv("OPENAI_API_KEY")
-
-client = OpenAI(api_key=api_key) if api_key else None
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 def consult_ai(patient_data: dict, prediction: str, probabilities: dict) -> str:
     """
