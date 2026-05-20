@@ -18,11 +18,6 @@ from starlette.middleware.sessions import SessionMiddleware
 
 
 # ==== módulos locales (debes tener estos archivos) ====
-# validator.py: def validate_inputs(dict)->dict ; class ValidationError(Exception)
-# mailer.py: def send_email(to, subject, body, attachment_path=None)
-# ai_consult.py: def consult_ai(patient_data, pred_label, prob_dict)->str
-# report_pdf.py: def generate_pdf(patient_data, prediction, probabilities, filename="...", doctor="...", clinica="...", comentario_ia=None)
-# predict_kidney_model.py: def safe_load_model(path)->(model, feat_order); def safe_predict_proba(model, X)->np.ndarray
 from validator import validate_inputs, ValidationError
 from mailer import send_email
 from ai_consult import consult_ai
@@ -190,14 +185,13 @@ def _pad3(arr):
         arr = np.array([arr[0], 0.0, arr[1]])
         s = arr.sum()
         return arr / s if s > 0 else np.array([1 / 3, 1 / 3, 1 / 3])
-    # fallback
     arr = arr[:3] if arr.size >= 3 else np.pad(arr, (0, 3 - arr.size))
     s = arr.sum()
     return arr / s if s > 0 else np.array([1 / 3, 1 / 3, 1 / 3])
 
 
 # Cargar modelo de forma segura
-MODEL_BUNDLE = safe_load_model(MODEL_PATH)  # (model, feat_order) o (None, FEATURES) si no hay modelo
+MODEL_BUNDLE = safe_load_model(MODEL_PATH)
 
 
 def predict_blended(vals: dict, especie: str, model_bundle):
@@ -207,8 +201,7 @@ def predict_blended(vals: dict, especie: str, model_bundle):
     # 2) Modelo ML
     model, feat_order = model_bundle
     X = pd.DataFrame([vals])[feat_order]
-    probs_ml = safe_predict_proba(model, X)[0]  # <- ahora siempre [bajo,medio,alto]
-    # normalización por seguridad
+    probs_ml = safe_predict_proba(model, X)[0]
     probs_ml = np.array(probs_ml, dtype=float)
     s = probs_ml.sum()
     if s <= 0:
@@ -216,16 +209,14 @@ def predict_blended(vals: dict, especie: str, model_bundle):
     else:
         probs_ml = probs_ml / s
 
-    # 3) Mezcla reglas + modelo (ajusta pesos si tu modelo aún está poco calibrado)
+    # 3) Mezcla reglas + modelo
     w_rules = 0.40
     w_ml = 0.60
     final_probs = w_rules * np.array(probs_rules) + w_ml * probs_ml
 
-    # normalizar y argmax
     final_probs = final_probs / final_probs.sum()
     pred_idx = int(np.argmax(final_probs))
 
-    # LOG de diagnóstico (revisa en logs de Render)
     try:
         print(
             "[DEBUG] rules:", probs_rules,
@@ -244,10 +235,6 @@ def current_user(request: Request) -> Optional[Dict[str, Any]]:
 
 
 def require_login_or_redirect(request: Request) -> Optional[RedirectResponse]:
-    """
-    Si no hay sesión, retorna un RedirectResponse a /auth.
-    Si hay sesión, retorna None.
-    """
     if not current_user(request):
         return RedirectResponse("/auth", status_code=status.HTTP_303_SEE_OTHER)
     return None
@@ -274,7 +261,6 @@ def _history_for(user_id: int):
 # ====================== Rutas HTML ======================
 @app.get("/")
 def home(request: Request):
-    # si hay sesión → dashboard; si no → auth
     if current_user(request):
         return RedirectResponse("/dashboard", status_code=status.HTTP_303_SEE_OTHER)
     return RedirectResponse("/auth", status_code=status.HTTP_303_SEE_OTHER)
@@ -282,8 +268,11 @@ def home(request: Request):
 
 @app.get("/auth")
 def auth_get(request: Request):
-    # auth.html debe mostrar login / registro / verificación
-    return templates.TemplateResponse("auth.html", {"request": request, "title": APP_TITLE})
+    return templates.TemplateResponse(
+        request=request,
+        name="auth.html",
+        context={"title": APP_TITLE}
+    )
 
 
 @app.post("/auth/register")
@@ -297,7 +286,9 @@ def auth_register(
 ):
     if password != password2:
         return templates.TemplateResponse(
-            "auth.html", {"request": request, "title": APP_TITLE, "error": "Las contraseñas no coinciden."}
+            request=request,
+            name="auth.html",
+            context={"title": APP_TITLE, "error": "Las contraseñas no coinciden."}
         )
 
     conn = get_db()
@@ -306,7 +297,9 @@ def auth_register(
     if cur.fetchone():
         conn.close()
         return templates.TemplateResponse(
-            "auth.html", {"request": request, "title": APP_TITLE, "error": "El correo ya está registrado."}
+            request=request,
+            name="auth.html",
+            context={"title": APP_TITLE, "error": "El correo ya está registrado."}
         )
 
     pw_hash = hash_password(password)
@@ -320,19 +313,18 @@ def auth_register(
     conn.commit()
     conn.close()
 
-    # Enviar email con el código (opcional)
     try:
         send_email(email, "Verificación de cuenta", f"Tu código de verificación es: {code}")
     except Exception as e:
         print("Error enviando correo de verificación:", e)
 
     return templates.TemplateResponse(
-        "auth.html",
-        {
-            "request": request,
+        request=request,
+        name="auth.html",
+        context={
             "title": APP_TITLE,
             "success": "Cuenta creada. Revisa tu correo para el código de verificación.",
-        },
+        }
     )
 
 
@@ -348,20 +340,26 @@ def auth_verify(request: Request, email: str = Form(...), code: str = Form(...))
     if not row:
         conn.close()
         return templates.TemplateResponse(
-            "auth.html", {"request": request, "title": APP_TITLE, "error": "Usuario no encontrado."}
+            request=request,
+            name="auth.html",
+            context={"title": APP_TITLE, "error": "Usuario no encontrado."}
         )
 
     uid, real_code, exp = row
     if (real_code or "").upper().strip() != code.upper().strip():
         conn.close()
         return templates.TemplateResponse(
-            "auth.html", {"request": request, "title": APP_TITLE, "error": "Código inválido."}
+            request=request,
+            name="auth.html",
+            context={"title": APP_TITLE, "error": "Código inválido."}
         )
 
     if exp and datetime.utcnow() > datetime.fromisoformat(exp):
         conn.close()
         return templates.TemplateResponse(
-            "auth.html", {"request": request, "title": APP_TITLE, "error": "El código ha expirado."}
+            request=request,
+            name="auth.html",
+            context={"title": APP_TITLE, "error": "El código ha expirado."}
         )
 
     cur.execute(
@@ -372,7 +370,9 @@ def auth_verify(request: Request, email: str = Form(...), code: str = Form(...))
     conn.close()
 
     return templates.TemplateResponse(
-        "auth.html", {"request": request, "title": APP_TITLE, "success": "Correo verificado, ahora puedes iniciar sesión."}
+        request=request,
+        name="auth.html",
+        context={"title": APP_TITLE, "success": "Correo verificado, ahora puedes iniciar sesión."}
     )
 
 
@@ -389,18 +389,24 @@ def auth_login(request: Request, email: str = Form(...), password: str = Form(..
 
     if not row:
         return templates.TemplateResponse(
-            "auth.html", {"request": request, "title": APP_TITLE, "error": "Usuario no encontrado."}
+            request=request,
+            name="auth.html",
+            context={"title": APP_TITLE, "error": "Usuario no encontrado."}
         )
 
     uid, name, email, pw_hash, clinic, role, verified = row
     if not verify_password(password, pw_hash):
         return templates.TemplateResponse(
-            "auth.html", {"request": request, "title": APP_TITLE, "error": "Contraseña incorrecta."}
+            request=request,
+            name="auth.html",
+            context={"title": APP_TITLE, "error": "Contraseña incorrecta."}
         )
 
     if not verified:
         return templates.TemplateResponse(
-            "auth.html", {"request": request, "title": APP_TITLE, "error": "Cuenta no verificada."}
+            request=request,
+            name="auth.html",
+            context={"title": APP_TITLE, "error": "Cuenta no verificada."}
         )
 
     request.session["user"] = {"id": uid, "name": name, "email": email, "clinic": clinic, "role": role}
@@ -423,10 +429,8 @@ def dashboard(request: Request):
     vals = {}
     result = None
 
-    # Si venimos con ?case_id= para re-cargar un caso del historial
     case_id = None
     try:
-        # Extraer desde query string
         q = dict(request.query_params)
         if "case_id" in q and q["case_id"]:
             case_id = int(q["case_id"])
@@ -461,16 +465,16 @@ def dashboard(request: Request):
             }
 
     return templates.TemplateResponse(
-        "dashboard.html",
-        {
-            "request": request,
+        request=request,
+        name="dashboard.html",
+        context={
             "title": APP_TITLE,
             "user": user,
             "species": SPECIES_OPTIONS,
             "vals": vals,
             "result": result,
             "history": _history_for(user["id"]),
-        },
+        }
     )
 
 
@@ -507,23 +511,21 @@ def predict_form(
         vals = validate_inputs(raw_vals)
     except ValidationError as e:
         return templates.TemplateResponse(
-            "dashboard.html",
-            {
-                "request": request,
+            request=request,
+            name="dashboard.html",
+            context={
                 "title": APP_TITLE,
                 "user": user,
                 "species": SPECIES_OPTIONS,
                 "error": str(e),
-                "vals": {},  # form vacío si error
+                "vals": {},
                 "history": _history_for(user["id"]),
-            },
+            }
         )
 
-    # Predicción
     pred_idx, probs = predict_blended(vals, especie, MODEL_BUNDLE)
     pred_label, _ = RISK_LABELS[pred_idx]
 
-    # Guardar caso
     try:
         conn = get_db()
         cur = conn.cursor()
@@ -557,28 +559,27 @@ def predict_form(
         conn.close()
     except Exception as e:
         return templates.TemplateResponse(
-            "dashboard.html",
-            {
-                "request": request,
+            request=request,
+            name="dashboard.html",
+            context={
                 "title": APP_TITLE,
                 "user": user,
                 "species": SPECIES_OPTIONS,
                 "error": f"DB error: {e}",
                 "vals": {},
                 "history": _history_for(user["id"]),
-            },
+            }
         )
 
-    # Render resultado con formulario vacío
     return templates.TemplateResponse(
-        "dashboard.html",
-        {
-            "request": request,
+        request=request,
+        name="dashboard.html",
+        context={
             "title": APP_TITLE,
             "user": user,
             "species": SPECIES_OPTIONS,
             "success": f"Riesgo {pred_label}",
-            "vals": vals,  # 👈 vacío siempre después de predecir
+            "vals": vals,
             "result": {
                 "nombre": nombre,
                 "especie": especie,
@@ -587,8 +588,9 @@ def predict_form(
                 "probs": [float(x) for x in probs],
             },
             "history": _history_for(user["id"]),
-        },
+        }
     )
+
 
 # ========================= PDF =========================
 @app.post("/predict/pdf")
@@ -623,23 +625,21 @@ def predict_and_pdf(
         vals = validate_inputs(raw_vals)
     except ValidationError as e:
         return templates.TemplateResponse(
-            "dashboard.html",
-            {
-                "request": request,
+            request=request,
+            name="dashboard.html",
+            context={
                 "title": APP_TITLE,
                 "user": user,
                 "species": SPECIES_OPTIONS,
                 "error": str(e),
                 "vals": {},
                 "history": _history_for(user["id"]),
-            },
+            }
         )
 
-    # Predicción
     pred_idx, probs = predict_blended(vals, especie, MODEL_BUNDLE)
     pred_label, _ = RISK_LABELS[pred_idx]
 
-    # Datos paciente
     patient_data = {
         "Nombre": nombre,
         "Especie": especie,
@@ -652,14 +652,12 @@ def predict_and_pdf(
         "Alto": float(probs[2]),
     }
 
-    # Ruta PDF
     safe_name = "".join(
         [c for c in nombre if c.isalnum() or c in (" ", "_", "-")]
     ).strip() or "paciente"
     pdf_path = os.path.join(BASE_DIR, f"reporte_{safe_name}.pdf")
 
     try:
-        # Generar PDF
         generate_report_pdf(
             patient_data,
             pred_label,
@@ -670,43 +668,40 @@ def predict_and_pdf(
             comentario_ia=None,
         )
 
-        # Copiar al static para descarga
         from shutil import copyfile
         public_path = os.path.join(static_dir, os.path.basename(pdf_path))
         copyfile(pdf_path, public_path)
         pdf_url = f"/static/{os.path.basename(pdf_path)}"
 
-        # Enviar por correo con try-except BIEN cerrado ✅
         try:
-            from mailer import send_email
+            # Corregido: usando el parámetro 'attachment_path' declarado arriba en tus comentarios estructurales
             send_email(
-                to_email=user.get("email"),
+                to=user.get("email"),
                 subject="Reporte Predicción Renal",
                 body="Adjunto encontrarás el reporte PDF de tu paciente.",
-                pdf_path=pdf_path,
+                attachment_path=pdf_path,
             )
         except Exception as e:
             print("⚠️ Error al enviar correo:", e)
 
     except Exception as e:
         return templates.TemplateResponse(
-            "dashboard.html",
-            {
-                "request": request,
+            request=request,
+            name="dashboard.html",
+            context={
                 "title": APP_TITLE,
                 "user": user,
                 "species": SPECIES_OPTIONS,
                 "error": f"No se pudo generar el PDF: {e}",
                 "vals": {},
                 "history": _history_for(user["id"]),
-            },
+            }
         )
 
-    # Respuesta con link al PDF
     return templates.TemplateResponse(
-        "dashboard.html",
-        {
-            "request": request,
+        request=request,
+        name="dashboard.html",
+        context={
             "title": APP_TITLE,
             "user": user,
             "species": SPECIES_OPTIONS,
@@ -724,15 +719,13 @@ def predict_and_pdf(
                 "pred_label": pred_label,
                 "probs": [float(x) for x in probs],
             },
-            "pdf_url": pdf_url,  # 👈 link para descarga
+            "pdf_url": pdf_url,
             "history": _history_for(user["id"]),
-        },
+        }
     )
 
 
 # ==================== Consulta con IA ====================
-from typing import Optional
-
 @app.post("/ai/consult")
 def ai_consult_route(
     request: Request,
@@ -752,7 +745,6 @@ def ai_consult_route(
 
     user = current_user(request)
 
-    # Si algún valor viene vacío, lo convertimos a 0.0
     raw_vals = {
         "Edad": Edad or 0.0,
         "Peso": Peso or 0.0,
@@ -766,37 +758,33 @@ def ai_consult_route(
         vals = validate_inputs(raw_vals)
     except ValidationError as e:
         return templates.TemplateResponse(
-            "dashboard.html",
-            {
-                "request": request,
+            request=request,
+            name="dashboard.html",
+            context={
                 "title": APP_TITLE,
                 "user": user,
                 "species": SPECIES_OPTIONS,
                 "error": str(e),
                 "vals": {},
                 "history": _history_for(user["id"]),
-            },
+            }
         )
 
-    # Predicción con blending (modelo + reglas)
     pred_idx, probs = predict_blended(vals, especie, MODEL_BUNDLE)
     pred_label, _ = RISK_LABELS[pred_idx]
 
     patient_data = {"Nombre": nombre, "Especie": especie, "Raza": raza, **vals}
     prob_dict = {"Bajo": float(probs[0]), "Medio": float(probs[1]), "Alto": float(probs[2])}
 
-    # Consultar IA
     try:
         ai_text = consult_ai(patient_data, pred_label, prob_dict)
     except Exception as e:
         ai_text = f"No se pudo consultar a la IA: {e}"
 
-
-    # Renderizar dashboard con resultado + texto IA
     return templates.TemplateResponse(
-        "dashboard.html",
-        {
-            "request": request,
+        request=request,
+        name="dashboard.html",
+        context={
             "title": APP_TITLE,
             "user": user,
             "species": SPECIES_OPTIONS,
@@ -816,7 +804,7 @@ def ai_consult_route(
                 "ai_text": ai_text,
             },
             "history": _history_for(user["id"]),
-        },
+        }
     )
 
 
