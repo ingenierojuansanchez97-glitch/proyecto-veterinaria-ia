@@ -154,7 +154,6 @@ def verify_password(pw: str, stored: str) -> bool:
 
 # ======== Reglas clínicas + predicción combinada ========
 def classify_band(vals: dict, especie: str = "Canino"):
-    # Si la especie no está en el mapa, por defecto usamos los límites caninos
     esp_key = "Felino" if especie.lower() == "felino" else "Canino"
     refs = REF_RANGES[esp_key]
     
@@ -163,7 +162,6 @@ def classify_band(vals: dict, especie: str = "Canino"):
     bun = float(vals.get("BUN", 0.0))
     urea = float(vals.get("Urea", 0.0))
 
-    # Evaluación y asignación probabilística adaptada a guías reales IRIS
     if esp_key == "Felino":
         if crea >= 2.9 or sdma >= 26.0 or urea > 100.0:
             band_idx = 2  # Alto
@@ -199,11 +197,9 @@ def predict_blended(vals: dict, especie: str, model_bundle: tuple) -> Tuple[int,
     # 2) Procesamiento con el Modelo ML
     model, feat_order = model_bundle
     
-    # Preparar el vector inyectando el valor binario de la especie para el clasificador
     input_data = vals.copy()
     input_data["Es_Felino"] = 1.0 if especie.lower() == "felino" else 0.0
     
-    # Asegurar el DataFrame con las 7 columnas exactas requeridas
     X = pd.DataFrame([input_data])[feat_order]
     
     probs_ml = safe_predict_proba(model, X)[0]
@@ -280,7 +276,7 @@ def auth_get(request: Request):
 @app.post("/auth/register")
 def auth_register(
     request: Request,
-    background_tasks: BackgroundTasks,  # Inyección de tareas en segundo plano
+    background_tasks: BackgroundTasks,
     name: str = Form(...),
     email: str = Form(...),
     clinic: str = Form(""),
@@ -316,13 +312,16 @@ def auth_register(
     conn.commit()
     conn.close()
 
-    # En vez de ejecutar send_email de forma síncrona aquí, lo delegamos a FastAPI:
+    # NOTA: Imprimimos en consola el código por si hay problemas de red en Render
+    print(f"🔑 [LOG DE SEGURIDAD] Código de verificación para {email}: {code}")
+
+    # Delegamos el envío al background worker usando el nombre correcto del parámetro (to_email)
     try:
         background_tasks.add_task(
             send_email, 
-            email.lower().strip(), 
-            "Verificación de cuenta", 
-            f"Tu código de verificación es: {code}"
+            to_email=email.lower().strip(), 
+            subject="Verificación de cuenta", 
+            body=f"Tu código de verificación es: {code}"
         )
     except Exception as e:
         print("⚠️ Error al delegar la tarea de correo de verificación:", e)
@@ -332,7 +331,7 @@ def auth_register(
         name="auth.html",
         context={
             "title": APP_TITLE,
-            "success": "Cuenta creada con éxito. Ingresa el código enviado a tu correo corporativo.",
+            "success": "Cuenta creada con éxito. Ingresa el código enviado a tu correo corporativo o consúltalo en los logs.",
         }
     )
 
@@ -604,6 +603,7 @@ def predict_form(
 @app.post("/predict/pdf")
 def predict_and_pdf(
     request: Request,
+    background_tasks: BackgroundTasks, # Inyectamos background tasks para el correo del pdf
     nombre: str = Form("Paciente"),
     especie: str = Form("Canino"),
     raza: str = Form("—"),
@@ -647,7 +647,6 @@ def predict_and_pdf(
     pred_idx, probs = predict_blended(vals, especie, MODEL_BUNDLE)
     pred_label, _ = RISK_LABELS[pred_idx]
 
-    # Atributos limpios para renderizado del PDF corporativo
     patient_data = {
         "Nombre": nombre,
         "Especie": especie,
@@ -684,15 +683,17 @@ def predict_and_pdf(
         copyfile(pdf_path, public_path)
         pdf_url = f"/static/{os.path.basename(pdf_path)}"
 
+        # Usamos background_tasks para enviar el correo y evitar timeouts por red lenta
         try:
-            send_email(
-                to=user.get("email"),
+            background_tasks.add_task(
+                send_email,
+                to_email=user.get("email"),
                 subject=f"Reporte Digital de Diagnóstico Renal - {nombre}",
                 body=f"Estimado Dr. {user.get('name')},\n\nAdjunto encontrará el informe clínico automatizado en formato PDF correspondiente al paciente '{nombre}'.",
-                attachment_path=pdf_path,
+                pdf_path=pdf_path # Corregido parámetro de 'attachment_path' a 'pdf_path' de tu mailer.py
             )
         except Exception as e:
-            print("⚠️ Error al despachar correo electrónico:", e)
+            print("⚠️ Error al despachar correo electrónico en background:", e)
 
     except Exception as e:
         return templates.TemplateResponse(
@@ -788,19 +789,25 @@ def ai_consult_route(
     try:
         ai_text = consult_ai(patient_data, pred_label, prob_dict)
         
-        # Persistencia del reporte clínico generado por IA en la base de datos local
+        # Corrección sintaxis SQLite: Buscamos el ID del último caso guardado para este usuario y paciente
         conn = get_db()
         cur = conn.cursor()
         cur.execute(
             """
-            UPDATE casos_renales 
-            SET ai_text = ? 
+            SELECT id FROM casos_renales 
             WHERE user_id = ? AND nombre = ? 
             ORDER BY id DESC LIMIT 1
             """,
-            (ai_text, user["id"], nombre.strip())
+            (user["id"], nombre.strip())
         )
-        conn.commit()
+        last_case = cur.fetchone()
+        
+        if last_case:
+            cur.execute(
+                "UPDATE casos_renales SET ai_text = ? WHERE id = ?",
+                (ai_text, last_case["id"])
+            )
+            conn.commit()
         conn.close()
         
     except Exception as e:
