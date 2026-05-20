@@ -9,7 +9,8 @@ from typing import Optional, Dict, Any, Tuple
 import numpy as np
 import pandas as pd
 
-from fastapi import FastAPI, Request, Form, HTTPException, status
+# Se incluye BackgroundTasks para evitar bloqueos por envíos síncronos de correo
+from fastapi import FastAPI, Request, Form, HTTPException, status, BackgroundTasks
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -279,6 +280,7 @@ def auth_get(request: Request):
 @app.post("/auth/register")
 def auth_register(
     request: Request,
+    background_tasks: BackgroundTasks,  # Inyección de tareas en segundo plano
     name: str = Form(...),
     email: str = Form(...),
     clinic: str = Form(""),
@@ -314,10 +316,16 @@ def auth_register(
     conn.commit()
     conn.close()
 
+    # En vez de ejecutar send_email de forma síncrona aquí, lo delegamos a FastAPI:
     try:
-        send_email(email, "Verificación de cuenta", f"Tu código de verificación es: {code}")
+        background_tasks.add_task(
+            send_email, 
+            email.lower().strip(), 
+            "Verificación de cuenta", 
+            f"Tu código de verificación es: {code}"
+        )
     except Exception as e:
-        print("Error enviando correo de verificación:", e)
+        print("⚠️ Error al delegar la tarea de correo de verificación:", e)
 
     return templates.TemplateResponse(
         request=request,
