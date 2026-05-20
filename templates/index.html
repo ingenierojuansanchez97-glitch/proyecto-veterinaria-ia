@@ -1,0 +1,772 @@
+# app.py — Web app alineada con tus templates auth.html y dashboard.html
+
+import os
+import sqlite3
+import hashlib
+import secrets
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any, Tuple
+
+import numpy as np
+import pandas as pd
+
+from fastapi import FastAPI, Request, Depends, HTTPException, Form
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from starlette.middleware.sessions import SessionMiddleware
+
+# ==== módulos locales (debes tener estos archivos) ====
+# validator.validate_inputs debe lanzar ValidationError y devolver
+# un dict con las features validadas y tipadas.
+from validator import validate_inputs, ValidationError
+# mailer.send_email_with_pdf(to, subject, body, attachment_path=None)
+from mailer import send_email_with_pdf
+# ai_consult.consult_ai(patient_data, pred_label, prob_dict) -> str
+from ai_consult import consult_ai
+# report_pdf.generate_pdf(patient_data, pred_label, prob_dict, filename=..., **extra)
+from report_pdf import generate_pdf as generate_report_pdf
+# predict_kidney_model.safe_load_model(model_path) -> (model, feat_order)
+# predict_kidney_model.safe_predict_proba(model, X) -> np.ndarray shape (n, 3/2/…)
+from predict_kidney_model import safe_load_model, safe_predict_proba
+
+
+# ======================= Config =======================
+APP_TITLE = "Predicción Renal Veterinaria"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+DB_PATH = os.getenv("KIDNEY_APP_DB", os.path.join(BASE_DIR, "veterinaria.db"))
+MODEL_PATH = os.getenv("KIDNEY_MODEL", os.path.join(BASE_DIR, "model_kidney.pkl"))
+
+SECRET_KEY = os.getenv("APP_SECRET_KEY", "change-this-in-render")
+
+FEATURES = ["Edad", "Peso", "Creatinina", "Urea", "BUN", "SDMA"]
+SPECIES_OPTIONS = ["Canino", "Felino", "Ave", "Pez", "Reptil", "Caballo", "Cerdo", "Vaca", "Otro"]
+RISK_LABELS: Dict[int, Tuple[str, str]] = {
+    0: ("Bajo", "#43A047"),
+    1: ("Medio", "#FB8C00"),
+    2: ("Alto", "#E53935"),
+}
+
+REF_RANGES = {
+    "Canino": {"Creatinina": 1.4, "Urea": 50, "BUN": 25, "SDMA": 14},
+    "Felino": {"Creatinina": 1.6, "Urea": 60, "BUN": 28, "SDMA": 14},
+}
+
+# ==================== App & assets ====================
+app = FastAPI(title=APP_TITLE)
+app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY)
+
+static_dir = os.path.join(BASE_DIR, "static")
+templates_dir = os.path.join(BASE_DIR, "templates")
+os.makedirs(static_dir, exist_ok=True)
+os.makedirs(templates_dir, exist_ok=True)
+
+app.mount("/static", StaticFiles(directory=static_dir), name="static")
+templates = Jinja2Templates(directory=templates_dir)
+
+
+# ====================== DB utils ======================
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = get_db()
+    cur = conn.cursor()
+    # users
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            clinic TEXT,
+            role TEXT DEFAULT 'doctor',
+            email_verified INTEGER DEFAULT 0,
+            verification_code TEXT,
+            verification_expires TEXT
+        )
+        """
+    )
+    # casos_renales
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS casos_renales (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fecha_hora TEXT,
+            nombre TEXT,
+            especie TEXT,
+            raza TEXT,
+            edad REAL,
+            peso REAL,
+            creatinina REAL,
+            urea REAL,
+            bun REAL,
+            sdma REAL,
+            risk_label TEXT,
+            prob_bajo REAL,
+            prob_medio REAL,
+            prob_alto REAL,
+            user_id INTEGER,
+            clinic TEXT,
+            ai_text TEXT,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+        """
+    )
+
+    # Migraciones seguras (por si la tabla ya existía sin alguna columna)
+    def ensure(table: str, col: str, ddl: str):
+        try:
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+        except Exception:
+            # ya existe
+            pass
+
+    ensure("casos_renales", "user_id", "INTEGER")
+    ensure("casos_renales", "clinic", "TEXT")
+    ensure("casos_renales", "ai_text", "TEXT")
+
+    conn.commit()
+    conn.close()
+
+
+init_db()
+
+
+# ============= Seguridad (hash de password) ============
+def hash_password(pw: str, salt: Optional[str] = None) -> str:
+    if not salt:
+        salt = secrets.token_hex(8)
+    h = hashlib.sha256((salt + pw).encode("utf-8")).hexdigest()
+    return f"{salt}${h}"
+
+
+def verify_password(pw: str, stored: str) -> bool:
+    try:
+        salt, _h = stored.split("$")
+        return hash_password(pw, salt) == stored
+    except Exception:
+        return False
+
+
+# ======== Reglas clínicas + predicción combinada ========
+def classify_band(vals: dict, especie: str = "Canino"):
+    refs = REF_RANGES.get(especie, REF_RANGES["Canino"])
+    markers = ["Creatinina", "Urea", "BUN", "SDMA"]
+
+    mild_count = 0
+    severe_count = 0
+
+    for m in markers:
+        v = float(vals[m])
+        r = v / float(refs[m])
+        if r > 1.3:
+            severe_count += 1
+        elif r > 1.0:
+            mild_count += 1
+
+    if severe_count >= 1 or (mild_count + severe_count) >= 2:
+        band_idx = 2  # Alto
+    elif mild_count == 1 and severe_count == 0:
+        band_idx = 1  # Medio
+    else:
+        band_idx = 0  # Bajo
+
+    probs = np.zeros(3, dtype=float)
+    probs[band_idx] = 0.80
+    return band_idx, probs
+
+
+def _pad3(arr):
+    arr = np.array(arr, dtype=float)
+    if arr.shape[0] == 3:
+        return arr
+    if arr.shape[0] == 2:
+        arr = np.array([arr[0], 0.0, arr[1]])
+        s = arr.sum()
+        return arr / s if s > 0 else np.array([1 / 3, 1 / 3, 1 / 3])
+    arr = arr[:3]
+    s = arr.sum()
+    return arr / s if s > 0 else np.array([1 / 3, 1 / 3, 1 / 3])
+
+
+MODEL_BUNDLE = safe_load_model(MODEL_PATH)  # -> (model, feat_order)
+
+
+def predict_blended(vals: dict, especie: str, model_bundle):
+    # Reglas clínicas
+    _, probs_rules = classify_band(vals, especie)
+    # Modelo ML
+    model, feat_order = model_bundle
+    X = pd.DataFrame([vals])[feat_order]
+    probs_ml = safe_predict_proba(model, X)[0]
+    probs_ml = _pad3(probs_ml)
+
+    # Mezcla
+    final_probs = 0.30 * np.array(probs_rules) + 0.60 * np.array(probs_ml)
+    final_probs = final_probs / final_probs.sum()
+    pred_idx = int(np.argmax(final_probs))
+    return pred_idx, final_probs
+
+
+# ================== Helpers de sesión ==================
+def require_user(request: Request) -> Dict[str, Any]:
+    user = request.session.get("user")
+    if not user:
+        # Redirige a /auth si no hay sesión
+        raise HTTPException(status_code=302, detail="Redirect", headers={"Location": "/auth"})
+    return user
+
+
+def _history_for(user_id: int):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, nombre, especie, raza, risk_label, prob_bajo, prob_medio, prob_alto, fecha_hora
+        FROM casos_renales WHERE user_id=?
+        ORDER BY id DESC LIMIT 10
+        """,
+        (user_id,),
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+# ====================== Rutas HTML ======================
+@app.get("/")
+def home(request: Request):
+    user = request.session.get("user")
+    if user:
+        return RedirectResponse("/dashboard", status_code=302)
+    return RedirectResponse("/auth", status_code=302)
+
+
+@app.get("/auth")
+def auth_get(request: Request):
+    # auth.html debe mostrar login / registro / verificación
+    return templates.TemplateResponse("auth.html", {"request": request, "title": APP_TITLE})
+
+
+@app.post("/auth/register")
+def auth_register(
+    request: Request,
+    name: str = Form(...),
+    email: str = Form(...),
+    clinic: str = Form(""),
+    password: str = Form(...),
+    password2: str = Form(...),
+):
+    if password != password2:
+        return templates.TemplateResponse(
+            "auth.html",
+            {"request": request, "title": APP_TITLE, "error": "Las contraseñas no coinciden."},
+        )
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM users WHERE email=?", (email.lower().strip(),))
+    if cur.fetchone():
+        conn.close()
+        return templates.TemplateResponse(
+            "auth.html",
+            {"request": request, "title": APP_TITLE, "error": "El correo ya está registrado."},
+        )
+
+    pw_hash = hash_password(password)
+    code = secrets.token_hex(3).upper()
+    expires = (datetime.utcnow() + timedelta(hours=1)).isoformat()
+
+    cur.execute(
+        "INSERT INTO users (name,email,password_hash,clinic,verification_code,verification_expires) VALUES (?,?,?,?,?,?)",
+        (name, email.lower().strip(), pw_hash, clinic, code, expires),
+    )
+    conn.commit()
+    conn.close()
+
+    # Enviar email (si falla, no rompe el flujo)
+    try:
+        send_email_with_pdf(email, "Verificación de cuenta", f"Tu código de verificación es: {code}")
+    except Exception as e:
+        print("Error enviando correo:", e)
+
+    return templates.TemplateResponse(
+        "auth.html",
+        {"request": request, "title": APP_TITLE, "success": "Cuenta creada. Revisa tu correo para el código de verificación."},
+    )
+
+
+@app.post("/auth/verify")
+def auth_verify(request: Request, email: str = Form(...), code: str = Form(...)):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id,verification_code,verification_expires FROM users WHERE email=?", (email.lower().strip(),))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return templates.TemplateResponse(
+            "auth.html", {"request": request, "title": APP_TITLE, "error": "Usuario no encontrado."}
+        )
+
+    uid, real_code, exp = row
+    if (real_code or "").upper().strip() != code.upper().strip():
+        conn.close()
+        return templates.TemplateResponse(
+            "auth.html", {"request": request, "title": APP_TITLE, "error": "Código inválido."}
+        )
+
+    if exp and datetime.utcnow() > datetime.fromisoformat(exp):
+        conn.close()
+        return templates.TemplateResponse(
+            "auth.html", {"request": request, "title": APP_TITLE, "error": "El código ha expirado."}
+        )
+
+    cur.execute("UPDATE users SET email_verified=1, verification_code=NULL, verification_expires=NULL WHERE id=?", (uid,))
+    conn.commit()
+    conn.close()
+
+    return templates.TemplateResponse(
+        "auth.html", {"request": request, "title": APP_TITLE, "success": "Correo verificado, ahora puedes iniciar sesión."}
+    )
+
+
+@app.post("/auth/login")
+def auth_login(request: Request, email: str = Form(...), password: str = Form(...)):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id,name,email,password_hash,clinic,role,email_verified FROM users WHERE email=?",
+        (email.lower().strip(),),
+    )
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return templates.TemplateResponse(
+            "auth.html", {"request": request, "title": APP_TITLE, "error": "Usuario no encontrado."}
+        )
+
+    uid, name, email, pw_hash, clinic, role, verified = row
+    if not verify_password(password, pw_hash):
+        return templates.TemplateResponse(
+            "auth.html", {"request": request, "title": APP_TITLE, "error": "Contraseña incorrecta."}
+        )
+    if not verified:
+        return templates.TemplateResponse(
+            "auth.html", {"request": request, "title": APP_TITLE, "error": "Cuenta no verificada."}
+        )
+
+    request.session["user"] = {"id": uid, "name": name, "email": email, "clinic": clinic, "role": role}
+    return RedirectResponse("/dashboard", status_code=302)
+
+
+@app.get("/logout")
+def logout(request: Request):
+    request.session.clear()
+    return RedirectResponse("/auth", status_code=302)
+
+
+@app.get("/dashboard")
+def dashboard(request: Request, case_id: Optional[int] = None, user: dict = Depends(require_user)):
+    vals: Dict[str, Any] = {}
+    result: Optional[Dict[str, Any]] = None
+
+    if case_id:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM casos_renales WHERE id=? AND user_id=?", (case_id, user["id"]))
+        row = cur.fetchone()
+        conn.close()
+        if row:
+            vals = {
+                "Nombre": row["nombre"],
+                "Especie": row["especie"],
+                "Raza": row["raza"],
+                "Edad": row["edad"],
+                "Peso": row["peso"],
+                "Creatinina": row["creatinina"],
+                "Urea": row["urea"],
+                "BUN": row["bun"],
+                "SDMA": row["sdma"],
+            }
+            result = {
+                "nombre": row["nombre"],
+                "especie": row["especie"],
+                "raza": row["raza"],
+                "pred_label": row["risk_label"],
+                "probs": [row["prob_bajo"], row["prob_medio"], row["prob_alto"]],
+                "ai_text": row["ai_text"],
+            }
+
+    return templates.TemplateResponse(
+        "dashboard.html",
+        {
+            "request": request,
+            "title": APP_TITLE,
+            "user": user,
+            "species": SPECIES_OPTIONS,
+            "vals": vals,
+            "result": result,
+            "history": _history_for(user["id"]),
+        },
+    )
+
+
+# =================== Predicción (HTML) ===================
+@app.post("/predict")
+def predict_form(
+    request: Request,
+    user: Dict = Depends(require_user),
+    nombre: str = Form("Paciente"),
+    especie: str = Form("Canino"),
+    raza: str = Form("—"),
+    Edad: float = Form(...),
+    Peso: float = Form(...),
+    Creatinina: float = Form(...),
+    Urea: float = Form(...),
+    BUN: float = Form(...),
+    SDMA: float = Form(...),
+):
+    raw_vals = {
+        "Edad": Edad,
+        "Peso": Peso,
+        "Creatinina": Creatinina,
+        "Urea": Urea,
+        "BUN": BUN,
+        "SDMA": SDMA,
+    }
+    try:
+        vals = validate_inputs(raw_vals)
+    except ValidationError as e:
+        return templates.TemplateResponse(
+            "dashboard.html",
+            {
+                "request": request,
+                "title": APP_TITLE,
+                "user": user,
+                "species": SPECIES_OPTIONS,
+                "error": str(e),
+                "vals": {},
+                "history": _history_for(user["id"]),
+            },
+        )
+
+    # Predicción
+    pred_idx, probs = predict_blended(vals, especie, MODEL_BUNDLE)
+    pred_label, _ = RISK_LABELS[pred_idx]
+
+    # Guardar caso
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO casos_renales
+            (fecha_hora, nombre, especie, raza, edad, peso, creatinina, urea, bun, sdma,
+             risk_label, prob_bajo, prob_medio, prob_alto, user_id, clinic)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                datetime.utcnow().isoformat(),
+                nombre.strip(),
+                especie,
+                raza.strip(),
+                float(vals["Edad"]),
+                float(vals["Peso"]),
+                float(vals["Creatinina"]),
+                float(vals["Urea"]),
+                float(vals["BUN"]),
+                float(vals["SDMA"]),
+                pred_label,
+                float(probs[0]),
+                float(probs[1]),
+                float(probs[2]),
+                user["id"],
+                user.get("clinic"),
+            ),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        return templates.TemplateResponse(
+            "dashboard.html",
+            {
+                "request": request,
+                "title": APP_TITLE,
+                "user": user,
+                "species": SPECIES_OPTIONS,
+                "error": f"DB error: {e}",
+                "vals": {},
+                "history": _history_for(user["id"]),
+            },
+        )
+
+    # Enviar template con resultado y con valores cargados en el form
+    vals_for_form = {"Nombre": nombre, "Especie": especie, "Raza": raza, **vals}
+    return templates.TemplateResponse(
+        "dashboard.html",
+        {
+            "request": request,
+            "title": APP_TITLE,
+            "user": user,
+            "species": SPECIES_OPTIONS,
+            "success": f"Riesgo {pred_label}",
+            "vals": vals_for_form,
+            "result": {
+                "nombre": nombre,
+                "especie": especie,
+                "raza": raza,
+                "pred_label": pred_label,
+                "probs": [float(x) for x in probs],
+            },
+            "history": _history_for(user["id"]),
+        },
+    )
+
+
+# ========================= PDF =========================
+@app.post("/predict/pdf")
+def predict_and_pdf(
+    request: Request,
+    user: Dict = Depends(require_user),
+    nombre: str = Form("Paciente"),
+    especie: str = Form("Canino"),
+    raza: str = Form("—"),
+    Edad: float = Form(...),
+    Peso: float = Form(...),
+    Creatinina: float = Form(...),
+    Urea: float = Form(...),
+    BUN: float = Form(...),
+    SDMA: float = Form(...),
+):
+    raw_vals = {"Edad": Edad, "Peso": Peso, "Creatinina": Creatinina, "Urea": Urea, "BUN": BUN, "SDMA": SDMA}
+    try:
+        vals = validate_inputs(raw_vals)
+    except ValidationError as e:
+        return templates.TemplateResponse(
+            "dashboard.html",
+            {
+                "request": request,
+                "title": APP_TITLE,
+                "user": user,
+                "species": SPECIES_OPTIONS,
+                "error": str(e),
+                "vals": {},
+                "history": _history_for(user["id"]),
+            },
+        )
+
+    pred_idx, probs = predict_blended(vals, especie, MODEL_BUNDLE)
+    pred_label, _ = RISK_LABELS[pred_idx]
+
+    patient_data = {"Nombre": nombre, "Especie": especie, "Raza": raza, **{k: float(vals[k]) for k in FEATURES}}
+    prob_dict = {"Bajo": float(probs[0]), "Medio": float(probs[1]), "Alto": float(probs[2])}
+
+    safe_name = "".join([c for c in nombre if c.isalnum() or c in (" ", "_", "-")]).strip() or "paciente"
+    pdf_path = os.path.join(BASE_DIR, f"reporte_{safe_name}.pdf")
+
+    # Intentar firma extendida; si no, caer a firma simple
+    try:
+        generate_report_pdf(
+            patient_data,
+            pred_label,
+            prob_dict,
+            filename=pdf_path,
+            doctor=user.get("name", "Veterinario"),
+            clinica=user.get("clinic", "Clínica"),
+            comentario_ia=None,
+        )
+    except TypeError:
+        # Versión antigua del generador de PDF
+        generate_report_pdf(patient_data, pred_label, prob_dict, filename=pdf_path)
+
+    # Guardar caso (también en DB)
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO casos_renales
+            (fecha_hora, nombre, especie, raza, edad, peso, creatinina, urea, bun, sdma,
+             risk_label, prob_bajo, prob_medio, prob_alto, user_id, clinic)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                datetime.utcnow().isoformat(),
+                nombre.strip(),
+                especie,
+                raza.strip(),
+                float(vals["Edad"]),
+                float(vals["Peso"]),
+                float(vals["Creatinina"]),
+                float(vals["Urea"]),
+                float(vals["BUN"]),
+                float(vals["SDMA"]),
+                pred_label,
+                float(probs[0]),
+                float(probs[1]),
+                float(probs[2]),
+                user["id"],
+                user.get("clinic"),
+            ),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        return templates.TemplateResponse(
+            "dashboard.html",
+            {
+                "request": request,
+                "title": APP_TITLE,
+                "user": user,
+                "species": SPECIES_OPTIONS,
+                "error": f"DB error: {e}",
+                "vals": {},
+                "history": _history_for(user["id"]),
+            },
+        )
+
+    vals_for_form = {"Nombre": nombre, "Especie": especie, "Raza": raza, **vals}
+    return templates.TemplateResponse(
+        "dashboard.html",
+        {
+            "request": request,
+            "title": APP_TITLE,
+            "user": user,
+            "species": SPECIES_OPTIONS,
+            "success": "PDF generado.",
+            "vals": vals_for_form,
+            "result": {
+                "nombre": nombre,
+                "especie": especie,
+                "raza": raza,
+                "pred_label": pred_label,
+                "probs": [float(x) for x in probs],
+            },
+            "history": _history_for(user["id"]),
+        },
+    )
+
+
+# ==================== Consulta con IA ====================
+@app.post("/ai/consult")
+def ai_consult_route(
+    request: Request,
+    user: Dict = Depends(require_user),
+    nombre: str = Form(...),
+    especie: str = Form(...),
+    raza: str = Form(...),
+    Edad: float = Form(...),
+    Peso: float = Form(...),
+    Creatinina: float = Form(...),
+    Urea: float = Form(...),
+    BUN: float = Form(...),
+    SDMA: float = Form(...),
+):
+    raw_vals = {"Edad": Edad, "Peso": Peso, "Creatinina": Creatinina, "Urea": Urea, "BUN": BUN, "SDMA": SDMA}
+    try:
+        vals = validate_inputs(raw_vals)
+    except ValidationError as e:
+        return templates.TemplateResponse(
+            "dashboard.html",
+            {
+                "request": request,
+                "title": APP_TITLE,
+                "user": user,
+                "species": SPECIES_OPTIONS,
+                "error": str(e),
+                "vals": {},
+                "history": _history_for(user["id"]),
+            },
+        )
+
+    pred_idx, probs = predict_blended(vals, especie, MODEL_BUNDLE)
+    pred_label, _ = RISK_LABELS[pred_idx]
+
+    patient_data = {"Nombre": nombre, "Especie": especie, "Raza": raza, **{k: float(vals[k]) for k in FEATURES}}
+    prob_dict = {"Bajo": float(probs[0]), "Medio": float(probs[1]), "Alto": float(probs[2])}
+
+    try:
+        ai_text = consult_ai(patient_data, pred_label, prob_dict)
+    except Exception as e:
+        ai_text = f"No se pudo consultar a la IA: {e}"
+
+    # Guarda el comentario de IA con el caso
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO casos_renales
+            (fecha_hora, nombre, especie, raza, edad, peso, creatinina, urea, bun, sdma,
+             risk_label, prob_bajo, prob_medio, prob_alto, user_id, clinic, ai_text)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                datetime.utcnow().isoformat(),
+                nombre.strip(),
+                especie,
+                raza.strip(),
+                float(vals["Edad"]),
+                float(vals["Peso"]),
+                float(vals["Creatinina"]),
+                float(vals["Urea"]),
+                float(vals["BUN"]),
+                float(vals["SDMA"]),
+                pred_label,
+                float(probs[0]),
+                float(probs[1]),
+                float(probs[2]),
+                user["id"],
+                user.get("clinic"),
+                ai_text,
+            ),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        return templates.TemplateResponse(
+            "dashboard.html",
+            {
+                "request": request,
+                "title": APP_TITLE,
+                "user": user,
+                "species": SPECIES_OPTIONS,
+                "error": f"DB error: {e}",
+                "vals": {},
+                "history": _history_for(user["id"]),
+            },
+        )
+
+    vals_for_form = {"Nombre": nombre, "Especie": especie, "Raza": raza, **vals}
+    return templates.TemplateResponse(
+        "dashboard.html",
+        {
+            "request": request,
+            "title": APP_TITLE,
+            "user": user,
+            "species": SPECIES_OPTIONS,
+            "success": "Análisis de IA generado.",
+            "vals": vals_for_form,
+            "result": {
+                "nombre": nombre,
+                "especie": especie,
+                "raza": raza,
+                "pred_label": pred_label,
+                "probs": [float(x) for x in probs],
+                "ai_text": ai_text,
+            },
+            "history": _history_for(user["id"]),
+        },
+    )
+
+
+# ==================== Healthcheck simple ====================
+@app.get("/health")
+def health():
+    return {"ok": True}

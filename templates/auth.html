@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block content %}
+
+{% if error %}<div class="alert error">{{ error }}</div>{% endif %}
+{% if success %}<div class="alert success">{{ success }}</div>{% endif %}
+{% if info %}<div class="alert info">{{ info }}</div>{% endif %}
+
+<div class="grid-2">
+    <div class="card">
+        <h3>Iniciar sesión</h3>
+        <form method="post" action="/auth/login">
+            <label>Email</label><input type="email" name="email" required>
+            <label>Contraseña</label><input type="password" name="password" required>
+            <div style="margin-top:10px" class="center">
+                <button class="btn" type="submit">Entrar</button>
+            </div>
+        </form>
+    </div>
+
+    <div class="card">
+        <h3>Crear cuenta</h3>
+        <form method="post" action="/auth/register">
+            <label>Nombre completo</label><input name="name" required>
+            <label>Email</label><input type="email" name="email" required>
+            <label>Clínica (opcional)</label><input name="clinic">
+            <label>Contraseña</label><input type="password" name="password" required>
+            <label>Confirmar</label><input type="password" name="password2" required>
+            <div style="margin-top:10px" class="center">
+                <button class="btn" type="submit">Crear cuenta</button>
+            </div>
+        </form>
+        <hr style="margin:16px 0;">
+        <h4>Verificar correo</h4>
+        <form method="post" action="/auth/verify">
+            <label>Email</label><input type="email" name="email" required>
+            <label>Código</label><input name="code" required>
+            <div style="margin-top:10px" class="center">
+                <button class="btn warn" type="submit">Verificar</button>
+            </div>
+        </form>
+    </div>
+</div>
+{% endblock %}

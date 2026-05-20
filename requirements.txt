@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+itsdangerous
+jinja2
+aiofiles
+pandas
+numpy
+joblib
+scikit-learn
+reportlab
+email-validator
+openai
+fpdf
+matplotlib
+python-multipart

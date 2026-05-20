@@ -1,0 +1,149 @@
+{% extends "base.html" %}
+{% block content %}
+
+{% if error %}<div class="alert error">{{ error }}</div>{% endif %}
+{% if success %}<div class="alert success">{{ success }}</div>{% endif %}
+
+<div class="card">
+  <h3>Predicción</h3>
+  <form method="post" action="/predict">
+    <div class="param-grid">
+      <div class="col">
+        <label>Nombre</label>
+        <input name="nombre" value="{{ vals.Nombre or '' }}" required>
+      </div>
+      <div class="col">
+        <label>Especie</label>
+        <select name="especie">
+          {% for sp in species %}
+            <option value="{{ sp }}" {% if vals.Especie==sp %}selected{% endif %}>{{ sp }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="col">
+        <label>Raza</label>
+        <input name="raza" value="{{ vals.Raza or '' }}">
+      </div>
+    </div>
+
+    <div class="param-grid">
+      <div class="col"><label>Edad (años)</label><input type="number" step="1" name="Edad" value="{{ vals.Edad or '' }}" required></div>
+      <div class="col"><label>Peso (kg)</label><input type="number" name="Peso" step="0.1" min="0.5" max="120" value="{{ vals.Peso or '' }}" required></div>
+      <div class="col"><label>Creatinina (mg/dL)</label><input type="number" step="0.01" name="Creatinina" value="{{ vals.Creatinina or '' }}" required></div>
+      <div class="col"><label>Urea (mg/dL)</label><input type="number" step="0.01" name="Urea" value="{{ vals.Urea or '' }}" required></div>
+      <div class="col"><label>BUN (mg/dL)</label><input type="number" step="0.01" name="BUN" value="{{ vals.BUN or '' }}" required></div>
+      <div class="col"><label>SDMA (µg/dL)</label><input type="number" step="0.01" name="SDMA" value="{{ vals.SDMA or '' }}" required></div>
+    </div>
+
+    <div class="btn-grid">
+      <button class="btn" type="submit">Predecir</button>
+      <a href="/dashboard" class="btn secondary">🗑️ Borrar datos</a>
+    </div>
+  </form>
+</div>
+
+{% if result %}
+<div class="card">
+  <h3>Resultado</h3>
+  {% set c = "green" if result.pred_label=="Bajo" else ("orange" if result.pred_label=="Medio" else "red") %}
+  <p><span class="badge {{ c }}">Riesgo {{ result.pred_label }}</span></p>
+  <div class="result-grid">
+    <div class="item">Bajo: {{ (result.probs[0]*100)|round(0) }}%</div>
+    <div class="item">Medio: {{ (result.probs[1]*100)|round(0) }}%</div>
+    <div class="item">Alto: {{ (result.probs[2]*100)|round(0) }}%</div>
+  </div>
+
+  <!-- Generar PDF -->
+  <form method="post" action="/predict/pdf" style="margin-top:10px">
+    <input type="hidden" name="nombre" value="{{ result.nombre }}">
+    <input type="hidden" name="especie" value="{{ result.especie }}">
+    <input type="hidden" name="raza" value="{{ result.raza }}">
+
+    <input type="hidden" name="Edad" value="{{ vals.Edad or 0 }}">
+    <input type="hidden" name="Peso" value="{{ vals.Peso or 0 }}">
+    <input type="hidden" name="Creatinina" value="{{ vals.Creatinina or 0 }}">
+    <input type="hidden" name="Urea" value="{{ vals.Urea or 0 }}">
+    <input type="hidden" name="BUN" value="{{ vals.BUN or 0 }}">
+    <input type="hidden" name="SDMA" value="{{ vals.SDMA or 0 }}">
+
+    <button class="btn" type="submit">Generar PDF</button>
+  </form>
+
+  <!-- Descargar PDF si existe -->
+  {% if pdf_url %}
+    <div style="margin-top:10px">
+      <a href="{{ pdf_url }}" class="btn secondary" download>📥 Descargar PDF</a>
+    </div>
+  {% endif %}
+
+  <!-- Consultar IA -->
+  <form method="post" action="/ai/consult" style="margin-top:10px">
+    <input type="hidden" name="nombre" value="{{ result.nombre }}">
+    <input type="hidden" name="especie" value="{{ result.especie }}">
+    <input type="hidden" name="raza" value="{{ result.raza }}">
+
+    <input type="hidden" name="Edad" value="{{ vals.Edad or 0 }}">
+    <input type="hidden" name="Peso" value="{{ vals.Peso or 0 }}">
+    <input type="hidden" name="Creatinina" value="{{ vals.Creatinina or 0 }}">
+    <input type="hidden" name="Urea" value="{{ vals.Urea or 0 }}">
+    <input type="hidden" name="BUN" value="{{ vals.BUN or 0 }}">
+    <input type="hidden" name="SDMA" value="{{ vals.SDMA or 0 }}">
+
+    <input type="hidden" name="pred_label" value="{{ result.pred_label }}">
+    <input type="hidden" name="pb" value="{{ result.probs[0] }}">
+    <input type="hidden" name="pm" value="{{ result.probs[1] }}">
+    <input type="hidden" name="pa" value="{{ result.probs[2] }}">
+
+    <button class="btn secondary" type="submit">Consultar con IA</button>
+  </form>
+
+  {% if result.ai_text %}
+  <div class="card">
+    <h3>Opinión de la IA</h3>
+  <div class="opinion-ia">
+    {{ result.ai_text | safe }}
+  </div>
+  {% endif %}
+</div>
+{% endif %}
+
+<div class="card">
+  <h3>Historial</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>Fecha</th>
+        <th>Nombre</th>
+        <th>Especie</th>
+        <th>Raza</th>
+        <th>Riesgo</th>
+        <th>Prob. dominante</th>
+        <th>Acción</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in history %}
+      {% set label = r.risk_label %}
+      {% set prob = (r.prob_alto if label=='Alto' else (r.prob_medio if label=='Medio' else r.prob_bajo)) %}
+      {% set c = 'red' if label=='Alto' else ('orange' if label=='Medio' else 'green') %}
+      <tr>
+        <td>{{ r.fecha_hora[:19] }}</td>
+        <td>{{ r.nombre }}</td>
+        <td>{{ r.especie }}</td>
+        <td>{{ r.raza }}</td>
+        <td><span class="badge {{ c }}">{{ label }}</span></td>
+        <td>{{ (prob*100)|round(0) }}%</td>
+        <td><a href="/dashboard?case_id={{ r.id }}" class="btn small">Cargar</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+{% endblock %}
+
+
+
+
+
+
