@@ -3,7 +3,7 @@ import os
 import sqlite3
 import hashlib
 import secrets
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, Tuple
 
 import numpy as np
@@ -305,7 +305,7 @@ def auth_register(
 
     pw_hash = hash_password(password)
     code = secrets.token_hex(3).upper()
-    expires = (datetime.utcnow() + datetime.timedelta(hours=1)).isoformat()
+    expires = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
 
     cur.execute(
         "INSERT INTO users (name,email,password_hash,clinic,verification_code,verification_expires) VALUES (?,?,?,?,?,?)",
@@ -355,7 +355,7 @@ def auth_verify(request: Request, email: str = Form(...), code: str = Form(...))
             context={"title": APP_TITLE, "error": "Código inválido."}
         )
 
-    if exp and datetime.utcnow() > datetime.fromisoformat(exp):
+    if exp and datetime.now(timezone.utc) > datetime.fromisoformat(exp).replace(tzinfo=timezone.utc):
         conn.close()
         return templates.TemplateResponse(
             request=request,
@@ -537,7 +537,7 @@ def predict_form(
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                datetime.utcnow().isoformat(),
+                datetime.now(timezone.utc).isoformat(),
                 nombre.strip(),
                 especie,
                 raza.strip(),
